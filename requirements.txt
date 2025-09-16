@@ -1,0 +1,33 @@
+# Core dependencies
+numpy>=1.20.0
+scipy>=1.7.0
+python-dateutil>=2.8.2
+
+# NLP and speech processing
+nltk>=3.6.0
+langdetect>=1.0.9
+python-speech-features>=0.6
+spacy>=3.0.0
+PyPDF2>=2.0.0
+pytesseract>=0.3.8
+Pillow>=8.0.0
+
+# Audio processing
+soundfile>=0.10.3
+SpeechRecognition>=3.8.1
+edge-tts>=4.0.0
+
+# AI and translation
+g4f>=0.0.1
+deep-translator>=1.9.0
+openai>=0.27.0  # For OpenRouter API compatibility
+
+# Weather and location
+python-weather>=1.0.0
+geopy>=2.2.0
+requests>=2.26.0
+beautifulsoup4>=4.10.0
+
+# Utilities
+schedule>=1.1.0
+argparse>=1.4.0
