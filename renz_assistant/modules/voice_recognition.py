@@ -9,7 +9,6 @@ import asyncio
 import subprocess
 import tempfile
 import threading
-import numpy as np
 from pathlib import Path
 from datetime import datetime
 

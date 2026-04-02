@@ -53,10 +53,10 @@ def main():
     
     # Check required modules
     required_modules = [
-        "numpy", "scipy", "nltk", "edge_tts", "requests", 
-        "python_dateutil", "geopy"
+        "nltk", "edge_tts", "requests",
+        "dateutil", "geopy"
     ]
-    
+
     print("\nChecking required Python modules:")
     all_modules_installed = True
     for module in required_modules:
@@ -65,9 +65,9 @@ def main():
         else:
             print_color("red", f"❌ {module} is not installed")
             all_modules_installed = False
-    
+
     # Check optional modules
-    optional_modules = ["vosk", "whisper", "openai"]
+    optional_modules = ["vosk", "whisper"]
     
     print("\nChecking optional Python modules:")
     for module in optional_modules:

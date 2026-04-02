@@ -1,49 +1,48 @@
 """
 Audio processing functions for Renz Assistant
 Enhanced with better TTS options and 100% Termux compatibility
+Pure Python implementation - no numpy/scipy/python_speech_features required
 """
 import os
 import time
-import tempfile
+import wave
+import struct
+import math
 import asyncio
 import subprocess
-import numpy as np
-from scipy.io import wavfile
-from scipy.signal import spectrogram
-from python_speech_features import mfcc
-import edge_tts
 import json
 from datetime import datetime
 
-from renz_assistant.modules.utils import cosine_similarity_manual
+import edge_tts
+
+from renz_assistant.modules.utils import cosine_similarity_manual, mean, std
+
 
 class AudioProcessor:
     """Handles audio recording, processing, and voice authentication"""
-    
+
     TEMP_AMR = "temp_voice_sample.amr"
     TEMP_WAV = "temp_voice_sample.wav"
     MAX_RETRIES = 5
     SAMPLE_COUNT = 3
     RECORD_DURATION = 10
-    
+
     def __init__(self, language_detector=None):
         """Initialize audio processor"""
         self.language_detector = language_detector
         self.cache_dir = os.path.join(os.path.expanduser("~"), ".renz_assistant", "cache")
-        
-        # Create cache directory if it doesn't exist
+
         if not os.path.exists(self.cache_dir):
             try:
                 os.makedirs(self.cache_dir)
             except Exception as e:
                 print(f"Failed to create cache directory: {e}")
-    
+
     def record_audio_sample(self):
         """Record audio sample directly to WAV (mono, 16 kHz)."""
         try:
             print("🎙️ Recording directly to WAV...")
             wav_file = self.TEMP_WAV
-            # Record directly to WAV using termux-microphone-record
             subprocess.run(
                 ["termux-microphone-record", "-f", wav_file, "-l", str(self.RECORD_DURATION)],
                 stdout=subprocess.DEVNULL,
@@ -58,80 +57,211 @@ class AudioProcessor:
         except Exception as e:
             print(f"❌ Recording error: {e}")
             return False
-    
+
+    def _read_wav(self, audio_file):
+        """Read a WAV file and return (sample_rate, float_samples_list)."""
+        with wave.open(audio_file, 'rb') as wf:
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            nframes = wf.getnframes()
+            raw_data = wf.readframes(nframes)
+
+        total_samples = nframes * nchannels
+        if sampwidth == 2:
+            fmt = f'<{total_samples}h'
+            max_val = 32768.0
+        elif sampwidth == 4:
+            fmt = f'<{total_samples}i'
+            max_val = 2147483648.0
+        elif sampwidth == 1:
+            fmt = f'<{total_samples}B'
+            max_val = 128.0
+        else:
+            raise ValueError(f"Unsupported sample width: {sampwidth}")
+
+        samples = list(struct.unpack(fmt, raw_data))
+
+        if sampwidth == 1:
+            samples = [s - 128 for s in samples]
+
+        if nchannels > 1:
+            samples = [
+                sum(samples[i:i + nchannels]) / nchannels
+                for i in range(0, len(samples), nchannels)
+            ]
+
+        max_abs = max((abs(s) for s in samples), default=1.0)
+        if max_abs == 0:
+            max_abs = 1.0
+        data = [s / max_abs for s in samples]
+
+        return framerate, data
+
+    def _fft_power(self, frame):
+        """
+        Compute power spectrum of a frame (must be power-of-2 length)
+        using an iterative Cooley-Tukey FFT with real/imag stored as tuples.
+        """
+        N = len(frame)
+        x = [(float(v), 0.0) for v in frame]
+
+        # Bit-reverse permutation
+        j = 0
+        for i in range(1, N):
+            bit = N >> 1
+            while j & bit:
+                j ^= bit
+                bit >>= 1
+            j ^= bit
+            if i < j:
+                x[i], x[j] = x[j], x[i]
+
+        # Butterfly operations
+        length = 2
+        while length <= N:
+            angle = -2.0 * math.pi / length
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+            for i in range(0, N, length):
+                wr, wi = 1.0, 0.0
+                for k in range(length // 2):
+                    ur, ui = x[i + k]
+                    vr, vi = x[i + k + length // 2]
+                    tvr = vr * wr - vi * wi
+                    tvi = vr * wi + vi * wr
+                    x[i + k] = (ur + tvr, ui + tvi)
+                    x[i + k + length // 2] = (ur - tvr, ui - tvi)
+                    new_wr = wr * cos_a - wi * sin_a
+                    wi = wr * sin_a + wi * cos_a
+                    wr = new_wr
+            length <<= 1
+
+        power = [x[k][0] ** 2 + x[k][1] ** 2 for k in range(N // 2 + 1)]
+        return power
+
+    def _apply_mel_filterbank(self, power_spectrum, sample_rate, n_filters=13):
+        """Apply mel filterbank to power spectrum and return log energies."""
+        N = len(power_spectrum)
+        freq_max = sample_rate / 2.0
+        freq_min = 0.0
+
+        mel_min = 2595.0 * math.log10(1.0 + freq_min / 700.0)
+        mel_max = 2595.0 * math.log10(1.0 + freq_max / 700.0)
+
+        mel_points = [
+            mel_min + i * (mel_max - mel_min) / (n_filters + 1)
+            for i in range(n_filters + 2)
+        ]
+
+        hz_points = [700.0 * (10.0 ** (m / 2595.0) - 1.0) for m in mel_points]
+
+        fft_size = (N - 1) * 2
+        bin_points = [
+            min(int(round(h * fft_size / sample_rate)), N - 1)
+            for h in hz_points
+        ]
+
+        energies = []
+        for m in range(1, n_filters + 1):
+            energy = 0.0
+            lo = bin_points[m - 1]
+            mid = bin_points[m]
+            hi = bin_points[m + 1]
+
+            denom1 = mid - lo if mid > lo else 1
+            for k in range(lo, mid):
+                weight = (k - lo) / denom1
+                energy += power_spectrum[k] * weight
+
+            denom2 = hi - mid if hi > mid else 1
+            for k in range(mid, hi):
+                weight = (hi - k) / denom2
+                energy += power_spectrum[k] * weight
+
+            energies.append(math.log(energy + 1e-10))
+
+        return energies
+
     def extract_voice_features(self, audio_file):
-        """Extract comprehensive voice features for authentication"""
+        """Extract comprehensive voice features for authentication - pure Python."""
         try:
             if not os.path.exists(audio_file):
                 return None
 
-            # Read audio file
-            sample_rate, data = wavfile.read(audio_file)
+            sample_rate, data = self._read_wav(audio_file)
 
-            # Convert to mono if stereo
-            if data.ndim > 1:
-                data = np.mean(data, axis=1)
+            if len(data) < 512:
+                print("❌ Audio too short for feature extraction")
+                return None
 
-            # Normalize
-            data = data.astype(np.float32)
-            if np.max(np.abs(data)) > 0:
-                data = data / np.max(np.abs(data))
+            frame_size = 256
+            hop_size = 128
+            n_filters = 13
 
-            # Extract MFCC features
-            mfcc_features = mfcc(
-                data,
-                sample_rate,
-                numcep=13,
-                nfilt=26,
-                winlen=0.025,
-                winstep=0.01)
-            mfcc_mean = np.mean(mfcc_features, axis=0)
-            mfcc_std = np.std(mfcc_features, axis=0)
+            hamming = [
+                0.54 - 0.46 * math.cos(2.0 * math.pi * n / (frame_size - 1))
+                for n in range(frame_size)
+            ]
 
-            # Extract spectral features
-            f, t, Sxx = spectrogram(
-                data, fs=sample_rate, nperseg=2048, noverlap=1024)
-
-            # Spectral centroid
-            centroids = np.sum(f.reshape(-1, 1) * Sxx,
-                            axis=0) / np.sum(Sxx, axis=0)
-            centroid_mean = np.mean(centroids)
-            centroid_std = np.std(centroids)
-
-            # Zero crossing rate
-            frame_length = 2048
-            hop_length = 1024
+            mel_energies_per_frame = []
             zcr_values = []
 
-            for i in range(0, len(data) - frame_length, hop_length):
-                frame = data[i: i + frame_length]
-                zcr = np.sum(np.abs(np.diff(np.sign(frame)))) / \
-                    (2 * frame_length)
+            for start in range(0, len(data) - frame_size, hop_size):
+                frame = data[start:start + frame_size]
+
+                windowed = [frame[i] * hamming[i] for i in range(frame_size)]
+
+                power = self._fft_power(windowed)
+
+                mel_e = self._apply_mel_filterbank(power, sample_rate, n_filters)
+                mel_energies_per_frame.append(mel_e)
+
+                signs = [1 if s >= 0 else -1 for s in frame]
+                zcr = sum(
+                    1 for i in range(1, len(signs)) if signs[i] != signs[i - 1]
+                ) / (2 * frame_size)
                 zcr_values.append(zcr)
 
-            zcr_mean = np.mean(zcr_values)
-            zcr_std = np.std(zcr_values)
+            if not mel_energies_per_frame:
+                return None
 
-            # Combine all features
-            features = np.concatenate(
-                [mfcc_mean, mfcc_std, [centroid_mean, centroid_std, zcr_mean, zcr_std]]
-            )
+            n_frames = len(mel_energies_per_frame)
+            mel_mean = [
+                sum(mel_energies_per_frame[f][k] for f in range(n_frames)) / n_frames
+                for k in range(n_filters)
+            ]
+            mel_std = [
+                math.sqrt(
+                    sum((mel_energies_per_frame[f][k] - mel_mean[k]) ** 2 for f in range(n_frames)) / n_frames
+                )
+                for k in range(n_filters)
+            ]
 
-            return features.tolist()
+            zcr_mean_val = mean(zcr_values)
+            zcr_std_val = std(zcr_values)
+
+            total_energy = sum(mel_mean) or 1.0
+            centroid_mean = sum(i * e for i, e in enumerate(mel_mean)) / total_energy
+
+            total_std_energy = sum(mel_std) or 1.0
+            centroid_std = sum(i * e for i, e in enumerate(mel_std)) / total_std_energy
+
+            features = mel_mean + mel_std + [centroid_mean, centroid_std, zcr_mean_val, zcr_std_val]
+            return features
 
         except Exception as e:
             print(f"❌ Feature extraction error: {e}")
             return None
-    
+
     def record_audio_with_wake_word_detection(self):
         """Enhanced audio recording with wake word detection via Termux options"""
         try:
             input_file_path = f"temp_audio_{time.time_ns()}.wav"
             print(f"🎤 Recording to {input_file_path}...")
-            
-            # Start Termux API
+
             subprocess.call("termux-api-start &> /dev/null", shell=True)
-            
+
             print("\nType 'r' and hit Enter to start recording...\nType 'e' and hit enter to exit.\n")
             while True:
                 user_input = input()
@@ -160,7 +290,7 @@ class AudioProcessor:
                     break
                 if user_input.lower() == "e":
                     return None
-            
+
             print("\nType 'q' and hit Enter to stop recording...\n")
             while True:
                 user_input = input()
@@ -172,21 +302,19 @@ class AudioProcessor:
                     )
                     print("Recording finished.")
                     break
-            
-            # Convert to WAV format
+
             output_file = input_file_path.replace(".opus", ".wav")
             self.convert_to_wav(input_file_path, output_file)
-            
+
             print(f"✅ Saved WAV file: {output_file}")
             return output_file
-            
+
         except Exception as e:
             print(f"❌ Recording error: {e}")
             return None
-    
+
     def convert_to_wav(self, input_file, output_file):
         """Convert audio file to WAV format"""
-        # Use a different name for the converted file to avoid overwriting
         converted_file = output_file.replace(".wav", "_converted.wav")
         subprocess.run(
             [
@@ -206,10 +334,9 @@ class AudioProcessor:
             ],
             check=True,
         )
-        # Remove the original input file and rename the converted file
         os.remove(input_file)
         os.rename(converted_file, output_file)
-    
+
     def clean_temp_files(self):
         """Clean all temporary recording files"""
         for file in os.listdir():
@@ -226,18 +353,16 @@ class AudioProcessor:
             print("❌ No voice profile found. Please register first.")
             return False
 
-        # Extract features from current audio
         current_features = self.extract_voice_features(audio_file)
         if not current_features:
             return False
 
-        # Compare with stored samples
         similarities = []
         for sample in voice_profile["samples"]:
             sim = cosine_similarity_manual(current_features, sample)
             similarities.append(sim)
 
-        average_similarity = np.mean(similarities)
+        average_similarity = mean(similarities)
         threshold = voice_profile["threshold"]
 
         print(f"🔐 Voice similarity: {average_similarity:.3f} (threshold: {threshold:.3f})")
@@ -248,7 +373,7 @@ class AudioProcessor:
         else:
             print("❌ Voice authentication failed")
             return False
-    
+
     def create_voice_profile_from_files(self, wav_files):
         """Create voice profile from existing WAV files"""
         samples = []
@@ -263,11 +388,9 @@ class AudioProcessor:
                 sim = cosine_similarity_manual(samples[i], samples[i + 1])
                 similarities.append(sim)
 
-            threshold = max(
-                0.75,
-                np.mean(similarities) -
-                0.5 *
-                np.std(similarities))
+            mean_sim = mean(similarities)
+            std_sim = std(similarities)
+            threshold = max(0.75, mean_sim - 0.5 * std_sim)
 
             voice_profile = {
                 "samples": samples,
@@ -283,7 +406,7 @@ class AudioProcessor:
 
 class TextToSpeech:
     """Handles text-to-speech functionality with multiple engines"""
-    
+
     def __init__(self, language_detector=None, user_preferences=None, personality_profiles=None):
         """Initialize text-to-speech with multiple engines"""
         self.language_detector = language_detector
@@ -295,27 +418,23 @@ class TextToSpeech:
                 "tts_speed": 1.0,
             }
         }
-        
-        # TTS engine preference
+
         self.tts_engine = self.user_preferences.get("tts_engine", "edge_tts")
-        
-        # Cache directory for TTS files
+
         self.cache_dir = os.path.join(os.path.expanduser("~"), ".renz_assistant", "tts_cache")
         if not os.path.exists(self.cache_dir):
             try:
                 os.makedirs(self.cache_dir)
             except Exception as e:
                 print(f"Failed to create TTS cache directory: {e}")
-        
-        # Check available TTS engines
+
         self.available_engines = self._check_available_engines()
         print(f"Available TTS engines: {', '.join(self.available_engines)}")
-    
+
     def _check_available_engines(self):
         """Check which TTS engines are available"""
         available = []
-        
-        # Check Termux TTS
+
         try:
             result = subprocess.run(
                 ["termux-tts-engines"],
@@ -327,15 +446,13 @@ class TextToSpeech:
                 available.append("termux_tts")
         except Exception:
             pass
-        
-        # Check edge-tts
+
         try:
             import edge_tts
             available.append("edge_tts")
         except ImportError:
             pass
-        
-        # Check espeak
+
         try:
             result = subprocess.run(
                 ["which", "espeak"],
@@ -347,8 +464,7 @@ class TextToSpeech:
                 available.append("espeak")
         except Exception:
             pass
-        
-        # Check festival
+
         try:
             result = subprocess.run(
                 ["which", "festival"],
@@ -360,36 +476,30 @@ class TextToSpeech:
                 available.append("festival")
         except Exception:
             pass
-        
-        # Always add fallback
+
         available.append("fallback")
-        
+
         return available
-    
+
     def set_tts_engine(self, engine):
         """Set TTS engine"""
         if engine in self.available_engines:
             self.tts_engine = engine
             return True
         return False
-    
+
     def advanced_tts(self, text, mood="neutral"):
         """Advanced TTS with mood-based speech modification using multiple engines"""
         if not text.strip():
             return
 
-        # Detect language if language detector is available
         lang = "id"
         if self.language_detector:
             lang = self.language_detector(text)
 
-        # Get personality settings
         personality = self.user_preferences.get("personality", "friendly")
-        base_speed = self.personality_profiles.get(personality, {}).get(
-            "tts_speed", 1.0
-        )
+        base_speed = self.personality_profiles.get(personality, {}).get("tts_speed", 1.0)
 
-        # Adjust speed based on mood
         mood_adjustments = {
             "happy": 1.15,
             "excited": 1.25,
@@ -401,8 +511,7 @@ class TextToSpeech:
             "neutral": 1.0,
         }
         final_speed = base_speed * mood_adjustments.get(mood, 1.0)
-        
-        # Try the selected TTS engine
+
         if self.tts_engine == "edge_tts" and "edge_tts" in self.available_engines:
             self._edge_tts(text, lang, final_speed)
         elif self.tts_engine == "termux_tts" and "termux_tts" in self.available_engines:
@@ -412,7 +521,6 @@ class TextToSpeech:
         elif self.tts_engine == "festival" and "festival" in self.available_engines:
             self._festival_tts(text, lang, final_speed)
         else:
-            # Fallback to any available engine
             if "edge_tts" in self.available_engines:
                 self._edge_tts(text, lang, final_speed)
             elif "termux_tts" in self.available_engines:
@@ -422,199 +530,149 @@ class TextToSpeech:
             elif "festival" in self.available_engines:
                 self._festival_tts(text, lang, final_speed)
             else:
-                # Ultimate fallback - just print the text
                 print(f"🔊 TTS: {text}")
-    
+
     async def _generate_edge_tts(self, tts_text, tts_voice, rate, out_path):
         """Generate TTS audio file using edge-tts"""
         communicator = edge_tts.Communicate(tts_text, tts_voice, rate=rate)
         await communicator.save(out_path)
-    
+
     def _edge_tts(self, text, lang, speed):
         """TTS using edge-tts"""
         try:
-            # Calculate delta rate for edge-tts (relative to 100%)
             delta = int((speed - 1.0) * 100)
-            rate_str = f"{delta:+d}%"  # example '+15%', '0%', '-20%'
+            rate_str = f"{delta:+d}%"
 
-            # Select voice based on language
             if lang == "id":
                 voice = "id-ID-GadisNeural"
             elif lang == "en":
                 voice = "en-US-JennyNeural"
             else:
-                voice = "en-US-JennyNeural"  # fallback
-            
-            # Create temporary MP3 file
+                voice = "en-US-JennyNeural"
+
             timestamp = int(time.time())
             tmp_path = os.path.join(self.cache_dir, f"tts_{timestamp}.mp3")
 
-            # Generate TTS & save
             asyncio.run(self._generate_edge_tts(text, voice, rate_str, tmp_path))
 
-            # Play via Termux media player
             subprocess.run(
                 ["termux-media-player", "play", tmp_path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            
-            # Wait for audio to finish playing
-            # This is a rough estimate based on text length and speed
+
             words = len(text.split())
             wait_time = max(1, min(10, words * 0.3 / speed))
             time.sleep(wait_time)
-            
-            # Clean up old files periodically
+
             self._clean_old_tts_files()
-            
+
             return True
         except Exception as e:
             print(f"[Edge TTS] Error: {e}")
             return False
-    
+
     def _termux_tts(self, text, lang, speed):
         """TTS using Termux TTS"""
         try:
-            # Get available engines
             result = subprocess.run(
                 ["termux-tts-engines"],
                 capture_output=True,
                 text=True,
                 timeout=5
             )
-            
+
             engines = []
             if result.returncode == 0:
                 try:
                     engines = json.loads(result.stdout)
                 except json.JSONDecodeError:
                     pass
-            
-            # Select engine based on language
+
             engine = None
             for e in engines:
                 if lang in e.get("language", ""):
                     engine = e.get("engine")
                     break
-            
-            # Adjust speed (Termux TTS uses 0.1 to 10.0 scale)
+
             termux_speed = max(0.1, min(10.0, speed * 5))
-            
+
             cmd = ["termux-tts-speak"]
-            
-            # Add language if available
+
             if lang:
                 cmd.extend(["-l", lang])
-            
-            # Add engine if available
+
             if engine:
                 cmd.extend(["-e", engine])
-            
-            # Add speed
+
             cmd.extend(["-r", str(termux_speed)])
-            
-            # Add text
             cmd.append(text)
-            
-            # Run TTS
+
             subprocess.run(cmd, check=True)
-            
-            # Wait for audio to finish playing
-            # This is a rough estimate based on text length and speed
+
             words = len(text.split())
             wait_time = max(1, min(10, words * 0.3 / speed))
             time.sleep(wait_time)
-            
+
             return True
         except Exception as e:
             print(f"[Termux TTS] Error: {e}")
             return False
-    
+
     def _espeak_tts(self, text, lang, speed):
         """TTS using espeak"""
         try:
-            # Map language codes
             lang_map = {
-                "id": "id",
-                "en": "en",
-                "ja": "ja",
-                "ko": "ko",
-                "zh": "zh",
-                "ar": "ar",
-                "de": "de",
-                "es": "es",
-                "fr": "fr",
-                "it": "it",
-                "nl": "nl",
-                "pt": "pt",
-                "ru": "ru",
-                "tr": "tr"
+                "id": "id", "en": "en", "ja": "ja", "ko": "ko",
+                "zh": "zh", "ar": "ar", "de": "de", "es": "es",
+                "fr": "fr", "it": "it", "nl": "nl", "pt": "pt",
+                "ru": "ru", "tr": "tr"
             }
-            
+
             espeak_lang = lang_map.get(lang, "en")
-            
-            # Adjust speed (espeak uses words per minute, default is 175)
             wpm = int(175 * speed)
-            
-            # Create command
+
             cmd = [
                 "espeak",
                 "-v", espeak_lang,
                 "-s", str(wpm),
-                "-a", "200",  # Volume (0-200)
+                "-a", "200",
                 text
             ]
-            
-            # Run espeak
+
             subprocess.run(cmd, check=True)
-            
             return True
         except Exception as e:
             print(f"[espeak TTS] Error: {e}")
             return False
-    
+
     def _festival_tts(self, text, lang, speed):
         """TTS using festival"""
         try:
-            # Festival doesn't support many languages, so we'll just use it for English
-            
-            # Create temporary file for festival
             tmp_file = os.path.join(self.cache_dir, "festival_text.txt")
             with open(tmp_file, "w") as f:
                 f.write(text)
-            
-            # Run festival
-            cmd = [
-                "festival",
-                "--tts",
-                tmp_file
-            ]
-            
+
+            cmd = ["festival", "--tts", tmp_file]
             subprocess.run(cmd, check=True)
-            
-            # Remove temporary file
+
             os.remove(tmp_file)
-            
             return True
         except Exception as e:
             print(f"[festival TTS] Error: {e}")
             return False
-    
+
     def _clean_old_tts_files(self):
         """Clean old TTS cache files"""
         try:
-            # Keep only the 10 most recent files
             files = []
             for file in os.listdir(self.cache_dir):
                 if file.startswith("tts_") and file.endswith(".mp3"):
                     file_path = os.path.join(self.cache_dir, file)
                     files.append((file_path, os.path.getmtime(file_path)))
-            
-            # Sort by modification time (newest first)
+
             files.sort(key=lambda x: x[1], reverse=True)
-            
-            # Remove old files
+
             for file_path, _ in files[10:]:
                 os.remove(file_path)
         except Exception as e:

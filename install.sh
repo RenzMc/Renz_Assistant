@@ -17,8 +17,10 @@ print_color() {
 # Check if running in Termux
 if [ -d "/data/data/com.termux" ]; then
     print_color "green" "✅ Running in Termux environment"
+    IS_TERMUX=true
 else
     print_color "yellow" "⚠️ Not running in Termux. Some features may not work correctly."
+    IS_TERMUX=false
 fi
 
 # Welcome message
@@ -30,47 +32,40 @@ print_color "blue" "Advanced Voice Assistant for Termux"
 print_color "blue" "Installation Script"
 echo ""
 
-# Update package lists
-print_color "yellow" "📦 Updating package lists..."
-pkg update -y || { print_color "red" "❌ Failed to update package lists"; exit 1; }
+if [ "$IS_TERMUX" = true ]; then
+    # Update package lists
+    print_color "yellow" "📦 Updating package lists..."
+    pkg update -y || { print_color "red" "❌ Failed to update package lists"; exit 1; }
 
-# Install required packages
-print_color "yellow" "📦 Installing required packages..."
-pkg install -y python ffmpeg termux-api || { print_color "red" "❌ Failed to install required packages"; exit 1; }
+    # Install required system packages
+    print_color "yellow" "📦 Installing required system packages..."
+    pkg install -y python ffmpeg termux-api || { print_color "red" "❌ Failed to install required packages"; exit 1; }
 
-# Create virtual environment (optional)
-read -p "Create a virtual environment? (y/n): " create_venv
-if [[ $create_venv == "y" || $create_venv == "Y" ]]; then
-    print_color "yellow" "📦 Installing virtualenv..."
-    pip install virtualenv || { print_color "red" "❌ Failed to install virtualenv"; exit 1; }
-    
-    print_color "yellow" "🔧 Creating virtual environment..."
-    virtualenv venv || { print_color "red" "❌ Failed to create virtual environment"; exit 1; }
-    
-    print_color "yellow" "🔧 Activating virtual environment..."
-    source venv/bin/activate || { print_color "red" "❌ Failed to activate virtual environment"; exit 1; }
-    
-    print_color "green" "✅ Virtual environment created and activated"
+    # Install Python dependencies via pip (lightweight, pure Python)
+    print_color "yellow" "📦 Installing Python dependencies..."
+    pip install -r requirements.txt || { print_color "red" "❌ Failed to install Python dependencies"; exit 1; }
+else
+    print_color "yellow" "📦 Installing Python dependencies..."
+    pip install -r requirements.txt || { print_color "red" "❌ Failed to install Python dependencies"; exit 1; }
 fi
-
-# Install Python dependencies
-print_color "yellow" "📦 Installing Python dependencies..."
-pip install -r requirements.txt || { print_color "red" "❌ Failed to install Python dependencies"; exit 1; }
 
 # Make run script executable
 print_color "yellow" "🔧 Making run script executable..."
 chmod +x run_assistant.py || { print_color "red" "❌ Failed to make run script executable"; exit 1; }
 
-# Setup storage access
-print_color "yellow" "🔧 Setting up storage access..."
-termux-setup-storage || print_color "yellow" "⚠️ Storage access setup may require manual confirmation"
+if [ "$IS_TERMUX" = true ]; then
+    # Setup storage access
+    print_color "yellow" "🔧 Setting up storage access..."
+    termux-setup-storage || print_color "yellow" "⚠️ Storage access setup may require manual confirmation"
 
-# Check for Termux API
-if command -v termux-battery-status &> /dev/null; then
-    print_color "green" "✅ Termux API is installed"
-else
-    print_color "red" "❌ Termux API is not installed. Please install it from the same source as your Termux app."
-    print_color "yellow" "You can install it with: pkg install termux-api"
+    # Check for Termux API
+    if command -v termux-battery-status &> /dev/null; then
+        print_color "green" "✅ Termux API is installed"
+    else
+        print_color "red" "❌ Termux API is not installed."
+        print_color "yellow" "Install it with: pkg install termux-api"
+        print_color "yellow" "Also install the Termux:API app from the same source as your Termux app."
+    fi
 fi
 
 # Run configuration
@@ -81,22 +76,26 @@ if [[ $run_config == "y" || $run_config == "Y" ]]; then
     ./run_assistant.py --config || { print_color "red" "❌ Configuration failed"; exit 1; }
 fi
 
-# Create desktop shortcut
-print_color "yellow" "🔧 Would you like to create a shortcut to launch Renz Assistant? (y/n): "
-read create_shortcut
-if [[ $create_shortcut == "y" || $create_shortcut == "Y" ]]; then
-    mkdir -p ~/.shortcuts
-    cat > ~/.shortcuts/RenzAssistant << EOF
+if [ "$IS_TERMUX" = true ]; then
+    # Create desktop shortcut
+    print_color "yellow" "🔧 Would you like to create a shortcut to launch Renz Assistant? (y/n): "
+    read create_shortcut
+    if [[ $create_shortcut == "y" || $create_shortcut == "Y" ]]; then
+        mkdir -p ~/.shortcuts
+        cat > ~/.shortcuts/RenzAssistant << EOF
 #!/bin/bash
 cd $(pwd)
 ./run_assistant.py
 EOF
-    chmod +x ~/.shortcuts/RenzAssistant
-    print_color "green" "✅ Shortcut created. You can find it in the Termux widget."
+        chmod +x ~/.shortcuts/RenzAssistant
+        print_color "green" "✅ Shortcut created. You can find it in the Termux widget."
+    fi
 fi
 
 # Installation complete
 print_color "green" "✅ Renz Assistant installation complete!"
 print_color "cyan" "To start the assistant, run: ./run_assistant.py"
 print_color "cyan" "To configure the assistant, run: ./run_assistant.py --config"
-print_color "yellow" "Make sure to grant all necessary permissions to Termux API app in Android settings."
+if [ "$IS_TERMUX" = true ]; then
+    print_color "yellow" "Make sure to grant all necessary permissions to Termux API app in Android settings."
+fi

@@ -11,7 +11,7 @@ import threading
 from datetime import datetime
 
 # Import modules
-from renz_assistant.modules.utils import cosine_similarity_manual
+from renz_assistant.modules.utils import cosine_similarity_manual, mean as _mean, std as _std
 from renz_assistant.modules.audio import AudioProcessor, TextToSpeech
 from renz_assistant.modules.nlp import LanguageProcessor
 from renz_assistant.modules.storage import DataManager
@@ -320,9 +320,8 @@ class RenzAssistant:
                     sim = cosine_similarity_manual(samples[i], samples[i + 1])
                     similarities.append(sim)
 
-                import numpy as np
-                mean_sim = np.mean(similarities)
-                std_sim = np.std(similarities)
+                mean_sim = _mean(similarities)
+                std_sim = _std(similarities)
                 threshold = max(0.75, mean_sim - 0.5 * std_sim)
 
                 voice_profile = {

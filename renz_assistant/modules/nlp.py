@@ -195,7 +195,7 @@ class LanguageProcessor:
         # First try: check aliases with regex word boundaries
         for app, aliases in app_aliases.items():
             for alias in aliases:
-                if ("\&quot; in alias) or ("[" in alias) or ("?" in alias) or ("^" in alias) or ("$" in alias) or ("(" in alias):
+                if ("\\" in alias) or ("[" in alias) or ("?" in alias) or ("^" in alias) or ("$" in alias) or ("(" in alias):
                     if re.search(alias, text_lower):
                         return app
                 else:
