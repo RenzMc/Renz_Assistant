@@ -108,7 +108,7 @@ def main():
         "renz_assistant/modules/audio.py",
         "renz_assistant/modules/nlp.py",
         "renz_assistant/modules/config.py",
-        "renz_assistant/modules/termux_api.py",
+        "renz_assistant/modules/device.py",
         "renz_assistant/modules/voice_recognition.py",
         "renz_assistant/modules/openrouter.py"
     ]
