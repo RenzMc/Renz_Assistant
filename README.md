@@ -45,8 +45,8 @@ An advanced modular voice assistant for Termux on Android devices with full Term
 
 3. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/renz-assistant.git
-   cd renz-assistant
+   git clone https://github.com/RenzMc/Renz_Assistant.git
+   cd Renz-Assistant
    ```
 
 4. Install Python dependencies:
